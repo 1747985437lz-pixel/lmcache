@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Standard
 import socket
 
+# Third Party
 import zmq
 import zmq.asyncio
 
+# First Party
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
@@ -26,8 +29,9 @@ def get_zmq_context():
     return zmq.asyncio.Context.instance()
 
 
-def get_zmq_socket(context, socket_path: str, protocol: str, role,
-                   bind_or_connect: str):
+def get_zmq_socket(
+    context, socket_path: str, protocol: str, role, bind_or_connect: str
+):
     """
     Create a ZeroMQ socket with the specified protocol and role.
     """
@@ -48,7 +52,7 @@ def close_zmq_socket(socket: zmq.asyncio.Socket, linger: int = 0) -> None:
     Close a ZeroMQ socket cleanly.
 
     :param socket: The zmq.Socket to be closed.
-    :param linger: LINGER period (in milliseconds). 
+    :param linger: LINGER period (in milliseconds).
     Default is 0 (drop immediately).
     """
     try:
@@ -68,8 +72,9 @@ def get_ip():
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except Exception:
-        logger.warning("Failed to get local IP address. "
-                       "Falling back to loopback address.")
+        logger.warning(
+            "Failed to get local IP address. Falling back to loopback address."
+        )
         return "127.0.0.1"  # Fallback to loopback
     finally:
         s.close()

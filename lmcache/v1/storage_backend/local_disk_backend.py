@@ -12,20 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
-import os
-import threading
+# Standard
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, List, Optional
+import asyncio
+import os
+import threading
 
+# Third Party
 import aiofiles
 import torch
 
+# First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
-from lmcache.utils import (CacheEngineKey, DiskCacheMetadata,
-                           _lmcache_nvtx_annotate)
+from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
@@ -35,13 +37,13 @@ from lmcache.v1.storage_backend.evictor import LRUEvictor, PutStatus
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 if TYPE_CHECKING:
+    # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
 
 
 class LocalDiskBackend(StorageBackendInterface):
-
     def __init__(
         self,
         config: LMCacheEngineConfig,
@@ -51,8 +53,7 @@ class LocalDiskBackend(StorageBackendInterface):
         lmcache_worker: Optional["LMCacheWorker"] = None,
         lookup_server: Optional[LookupServerInterface] = None,
     ):
-        self.dict: OrderedDict[CacheEngineKey,
-                               DiskCacheMetadata] = OrderedDict()
+        self.dict: OrderedDict[CacheEngineKey, DiskCacheMetadata] = OrderedDict()
         self.dst_device = dst_device
 
         self.local_cpu_backend = local_cpu_backend
@@ -84,8 +85,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
     ) -> str:
-        return os.path.join(self.path,
-                            key.to_string().replace("/", "-") + ".pt")
+        return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -137,8 +137,8 @@ class LocalDiskBackend(StorageBackendInterface):
         # push kv evict msg
         if self.lmcache_worker is not None:
             self.lmcache_worker.put_msg(
-                KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash,
-                           "disk"))
+                KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, "disk")
+            )
 
     def insert_key(self, key: CacheEngineKey, memory_obj: MemoryObj) -> None:
         path = self._key_to_path(key)
@@ -158,8 +158,8 @@ class LocalDiskBackend(StorageBackendInterface):
         # push kv admit msg
         if self.lmcache_worker is not None and not has_stored:
             self.lmcache_worker.put_msg(
-                KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash,
-                           "disk"))
+                KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "disk")
+            )
 
     def submit_put_task(
         self,
@@ -170,7 +170,8 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # Update cache recency
         evict_keys, put_status = self.evictor.update_on_put(
-            self.dict, memory_obj.get_physical_size())
+            self.dict, memory_obj.get_physical_size()
+        )
         if put_status == PutStatus.ILLEGAL:
             return None
         # evict caches
@@ -186,7 +187,8 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_lock.release()
 
         future = asyncio.run_coroutine_threadsafe(
-            self.async_save_bytes_to_disk(key, memory_obj), self.loop)
+            self.async_save_bytes_to_disk(key, memory_obj), self.loop
+        )
         return future
 
     def submit_prefetch_task(
@@ -210,7 +212,8 @@ class LocalDiskBackend(StorageBackendInterface):
         assert dtype is not None
         assert shape is not None
         future = asyncio.run_coroutine_threadsafe(
-            self.async_load_bytes_from_disk(path, dtype, shape), self.loop)
+            self.async_load_bytes_from_disk(path, dtype, shape), self.loop
+        )
         return future
 
     def get_blocking(
@@ -243,7 +246,7 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> Optional[Future]:
         """
         Non-blocking get function.
-        Using a dummy wrapper around prefetch for now. 
+        Using a dummy wrapper around prefetch for now.
         """
         # TODO(Jiayi): Need to align prefetch and get_non_blocking
         return self.submit_prefetch_task(key)
@@ -267,7 +270,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
-        async with aiofiles.open(path, 'wb') as f:
+        async with aiofiles.open(path, "wb") as f:
             await f.write(byte_array)
 
         self.insert_key(key, memory_obj)
@@ -294,7 +297,7 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.debug("Memory allocation failed during async disk load.")
             return None
         buffer = memory_obj.byte_array
-        async with aiofiles.open(path, 'rb') as f:
+        async with aiofiles.open(path, "rb") as f:
             await f.readinto(buffer)
         return memory_obj
 
@@ -315,7 +318,7 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.debug("Memory allocation failed during async disk load.")
             return None
         buffer = memory_obj.byte_array
-        with open(path, 'rb') as f:
+        with open(path, "rb") as f:
             f.readinto(buffer)
         return memory_obj
 

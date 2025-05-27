@@ -12,25 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import threading
+# Standard
 from collections import OrderedDict
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, List, Optional
+import threading
 
+# Third Party
 import torch
 
+# First Party
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.cache_controller.message import KVAdmitMsg, KVEvictMsg
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.lookup_server import LookupServerInterface
-from lmcache.v1.memory_management import (MemoryAllocatorInterface,
-                                          MemoryFormat, MemoryObj,
-                                          MixedMemoryAllocator)
+from lmcache.v1.memory_management import (
+    MemoryAllocatorInterface,
+    MemoryFormat,
+    MemoryObj,
+    MixedMemoryAllocator,
+)
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 
 if TYPE_CHECKING:
+    # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
@@ -46,12 +53,14 @@ class LocalCPUBackend(StorageBackendInterface):
     are still callable by the storage manager.
     """
 
-    def __init__(self,
-                 config: LMCacheEngineConfig,
-                 memory_allocator: MemoryAllocatorInterface,
-                 lookup_server: Optional[LookupServerInterface] = None,
-                 lmcache_worker: Optional["LMCacheWorker"] = None,
-                 layerwise: bool = False):
+    def __init__(
+        self,
+        config: LMCacheEngineConfig,
+        memory_allocator: MemoryAllocatorInterface,
+        lookup_server: Optional[LookupServerInterface] = None,
+        lmcache_worker: Optional["LMCacheWorker"] = None,
+        layerwise: bool = False,
+    ):
         self.hot_cache: OrderedDict[CacheEngineKey, MemoryObj] = OrderedDict()
         self.use_hot = config.local_cpu
         self.lookup_server = lookup_server
@@ -83,8 +92,9 @@ class LocalCPUBackend(StorageBackendInterface):
         """
         return False
 
-    def submit_put_task(self, key: CacheEngineKey,
-                        memory_obj: MemoryObj) -> Optional[Future]:
+    def submit_put_task(
+        self, key: CacheEngineKey, memory_obj: MemoryObj
+    ) -> Optional[Future]:
         """
         Synchronously put the MemoryObj into the local cpu backend.
         """
@@ -104,8 +114,8 @@ class LocalCPUBackend(StorageBackendInterface):
             # push kv admit msg
             if self.lmcache_worker is not None:
                 self.lmcache_worker.put_msg(
-                    KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash,
-                               "cpu"))
+                    KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "cpu")
+                )
         return None
 
     # NOTE (Jiayi): prefetch might be deprecated in the future.
@@ -176,18 +186,20 @@ class LocalCPUBackend(StorageBackendInterface):
 
             if self.lmcache_worker is not None:
                 self.lmcache_worker.put_msg(
-                    KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash,
-                               "cpu"))
+                    KVEvictMsg(self.instance_id, key.worker_id, key.chunk_hash, "cpu")
+                )
             # NOTE (Jiayi): This `return True` might not accurately reflect
             # whether the key is removed from the actual memory because
             # other backends might still (temporarily) hold the memory object.
             return True
 
-    def allocate(self,
-                 shape: torch.Size,
-                 dtype: torch.dtype,
-                 fmt: Optional[MemoryFormat] = None,
-                 eviction: bool = True) -> Optional[MemoryObj]:
+    def allocate(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        fmt: Optional[MemoryFormat] = None,
+        eviction: bool = True,
+    ) -> Optional[MemoryObj]:
         """
         allocate a memory object of shape and dtype
         evict if necessary. Storage manager should always call
@@ -242,19 +254,18 @@ class LocalCPUBackend(StorageBackendInterface):
             cpu_memory_obj = self.memory_allocator.allocate(
                 memory_obj.get_shape(),
                 memory_obj.get_dtype(),
-                fmt=memory_obj.get_memory_format())
+                fmt=memory_obj.get_memory_format(),
+            )
 
             if cpu_memory_obj is None:
-                logger.warning(
-                    "Memory allocation failed in cachegen deserializer")
+                logger.warning("Memory allocation failed in cachegen deserializer")
                 return None
 
             # Copy the tensor to the cpu memory object
             assert cpu_memory_obj.tensor is not None
             self.stream.wait_stream(torch.cuda.default_stream())
             with torch.cuda.stream(self.stream):
-                cpu_memory_obj.tensor.copy_(memory_obj.tensor,
-                                            non_blocking=True)
+                cpu_memory_obj.tensor.copy_(memory_obj.tensor, non_blocking=True)
             memory_obj.tensor.record_stream(self.stream)
 
             # Update the hot cache
@@ -266,8 +277,8 @@ class LocalCPUBackend(StorageBackendInterface):
             # Push kv msg
             if self.lmcache_worker is not None:
                 self.lmcache_worker.put_msg(
-                    KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash,
-                               "cpu"))
+                    KVAdmitMsg(self.instance_id, key.worker_id, key.chunk_hash, "cpu")
+                )
 
             logger.debug("Updated hot cache!")
         else:
@@ -280,8 +291,13 @@ class LocalCPUBackend(StorageBackendInterface):
                 # Push kv msg
                 if self.lmcache_worker is not None:
                     self.lmcache_worker.put_msg(
-                        KVAdmitMsg(self.instance_id, key.worker_id,
-                                   key.chunk_hash, "cpu"))
+                        KVAdmitMsg(
+                            self.instance_id,
+                            key.worker_id,
+                            key.chunk_hash,
+                            "cpu",
+                        )
+                    )
             else:
                 self.cpu_lock.release()
 

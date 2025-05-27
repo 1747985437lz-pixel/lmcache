@@ -12,24 +12,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
+# Standard
 from typing import Optional
+import asyncio
 
+# Third Party
 import msgspec
 import zmq
 
+# First Party
 from lmcache.logging import init_logger
-from lmcache.v1.cache_controller.controllers import (KVController,
-                                                     RegistrationController)
+from lmcache.v1.cache_controller.controllers import KVController, RegistrationController
 from lmcache.v1.cache_controller.executor import LMCacheClusterExecutor
 from lmcache.v1.cache_controller.message import CheckFinishMsg  # noqa: E501
 from lmcache.v1.cache_controller.rpc_utils import (  # noqa: E501
-    get_zmq_context, get_zmq_socket)
+    get_zmq_context,
+    get_zmq_socket,
+)
 
 from lmcache.v1.cache_controller.message import (  # isort: skip
-    ClearMsg, CompressMsg, DeRegisterMsg, HealthMsg, KVAdmitMsg, KVEvictMsg,
-    LookupMsg, MoveMsg, Msg, MsgBase, OrchMsg, OrchRetMsg, PinMsg,
-    QueryInstMsg, RegisterMsg, WorkerMsg)
+    ClearMsg,
+    CompressMsg,
+    DeRegisterMsg,
+    HealthMsg,
+    KVAdmitMsg,
+    KVEvictMsg,
+    LookupMsg,
+    MoveMsg,
+    Msg,
+    MsgBase,
+    OrchMsg,
+    OrchRetMsg,
+    PinMsg,
+    QueryInstMsg,
+    RegisterMsg,
+    WorkerMsg,
+)
 
 logger = init_logger(__name__)
 
@@ -39,9 +57,7 @@ logger = init_logger(__name__)
 
 
 class LMCacheControllerManager:
-
     def __init__(self, controller_url: str):
-
         self.zmq_context = get_zmq_context()
         self.controller_url = controller_url
         # TODO(Jiayi): We might need multiple sockets if there are more
@@ -69,18 +85,21 @@ class LMCacheControllerManager:
 
         # Cluster executor
         self.cluster_executor = LMCacheClusterExecutor(
-            reg_controller=self.reg_controller, )
+            reg_controller=self.reg_controller,
+        )
 
         # post initialization of controllers
         self.kv_controller.post_init(self.cluster_executor)
-        self.reg_controller.post_init(kv_controller=self.kv_controller,
-                                      cluster_executor=self.cluster_executor)
+        self.reg_controller.post_init(
+            kv_controller=self.kv_controller,
+            cluster_executor=self.cluster_executor,
+        )
 
-        #self.loop = asyncio.new_event_loop()
-        #self.thread = threading.Thread(target=self.loop.run_forever,
+        # self.loop = asyncio.new_event_loop()
+        # self.thread = threading.Thread(target=self.loop.run_forever,
         #                               daemon=True)
-        #self.thread.start()
-        #asyncio.run_coroutine_threadsafe(self.start_all(), self.loop)
+        # self.thread.start()
+        # asyncio.run_coroutine_threadsafe(self.start_all(), self.loop)
 
     async def handle_worker_message(self, msg: WorkerMsg) -> None:
         if isinstance(msg, RegisterMsg):
@@ -94,8 +113,7 @@ class LMCacheControllerManager:
         else:
             logger.error(f"Unknown worker message type: {msg}")
 
-    async def handle_orchestration_message(
-            self, msg: OrchMsg) -> Optional[OrchRetMsg]:
+    async def handle_orchestration_message(self, msg: OrchMsg) -> Optional[OrchRetMsg]:
         if isinstance(msg, LookupMsg):
             return await self.kv_controller.lookup(msg)
         elif isinstance(msg, HealthMsg):
@@ -131,7 +149,7 @@ class LMCacheControllerManager:
 
                     # FIXME(Jiayi): The abstraction of control messages
                     # might not be necessary.
-                    #elif isinstance(msg, ControlMsg):
+                    # elif isinstance(msg, ControlMsg):
                     #    await self.issue_control_message(msg)
                     elif isinstance(msg, OrchMsg):
                         await self.handle_orchestration_message(msg)
@@ -143,5 +161,5 @@ class LMCacheControllerManager:
     async def start_all(self):
         await asyncio.gather(
             self.handle_batched_request(self.controller_socket),
-            #self.handle_batched_request(other socket),
+            # self.handle_batched_request(other socket),
         )

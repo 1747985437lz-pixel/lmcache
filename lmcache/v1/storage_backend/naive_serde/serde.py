@@ -12,19 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import abc
+# Standard
 from typing import Optional
+import abc
 
+# First Party
 from lmcache.v1.memory_management import MemoryObj
 
 
 class Serializer(metaclass=abc.ABCMeta):
-
     @abc.abstractmethod
     def serialize(self, memory_obj: MemoryObj) -> MemoryObj:
         """
         Serialize/compress the memory object.
-        
+
         Input:
             memory_obj: the memory object to be serialized/compressed.
 
@@ -35,7 +36,6 @@ class Serializer(metaclass=abc.ABCMeta):
 
 
 class Deserializer(metaclass=abc.ABCMeta):
-
     @abc.abstractmethod
     def deserialize(self, memory_obj: MemoryObj) -> Optional[MemoryObj]:
         """

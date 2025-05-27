@@ -12,23 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
-import asyncio
+# Standard
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
+import argparse
+import asyncio
 
-import uvicorn
+# Third Party
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import uvicorn
 
+# First Party
 from lmcache.logging import init_logger
-from lmcache.v1.cache_controller.controller_manager import \
-    LMCacheControllerManager
+from lmcache.v1.cache_controller.controller_manager import LMCacheControllerManager
 from lmcache.v1.cache_controller.message import CheckFinishMsg  # noqa: E501
 from lmcache.v1.cache_controller.message import (  # noqa: E501
-    CheckFinishRetMsg, ClearMsg, ClearRetMsg, CompressMsg, CompressRetMsg,
-    HealthMsg, HealthRetMsg, LookupMsg, LookupRetMsg, MoveMsg, MoveRetMsg,
-    PinMsg, PinRetMsg, QueryInstMsg, QueryInstRetMsg)
+    CheckFinishRetMsg,
+    ClearMsg,
+    ClearRetMsg,
+    CompressMsg,
+    CompressRetMsg,
+    HealthMsg,
+    HealthRetMsg,
+    LookupMsg,
+    LookupRetMsg,
+    MoveMsg,
+    MoveRetMsg,
+    PinMsg,
+    PinRetMsg,
+    QueryInstMsg,
+    QueryInstRetMsg,
+)
 
 logger = init_logger(__name__)
 
@@ -43,7 +58,8 @@ def create_app(controller_url: str) -> FastAPI:
     async def lifespan(app: FastAPI):
         # Start background task here
         lmcache_cluster_monitor_task = asyncio.create_task(
-            lmcache_controller_manager.start_all())
+            lmcache_controller_manager.start_all()
+        )
         yield
         # Optionally cancel the task on shutdown
         lmcache_cluster_monitor_task.cancel()
@@ -60,9 +76,10 @@ def create_app(controller_url: str) -> FastAPI:
     @app.post("/query_instance")
     async def query_instance(req: QueryInstRequest):
         try:
-            msg = QueryInstMsg(ip=req.ip, )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            msg = QueryInstMsg(
+                ip=req.ip,
+            )
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, QueryInstRetMsg)
             return {"res": ret_msg.instance_id}
         except Exception as e:
@@ -78,9 +95,10 @@ def create_app(controller_url: str) -> FastAPI:
     @app.post("/lookup", response_model=LookupResponse)
     async def lookup(req: LookupRequest):
         try:
-            msg = LookupMsg(tokens=req.tokens, )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            msg = LookupMsg(
+                tokens=req.tokens,
+            )
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, LookupRetMsg)
             return LookupResponse(layout_info=ret_msg.layout_info)
         except Exception as e:
@@ -102,8 +120,7 @@ def create_app(controller_url: str) -> FastAPI:
                 tokens=req.tokens,
                 locations=req.locations,
             )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, ClearRetMsg)
             return ClearResponse(success=ret_msg.success)
         except Exception as e:
@@ -125,8 +142,7 @@ def create_app(controller_url: str) -> FastAPI:
                 locations=req.locations,
                 tokens=req.tokens,
             )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, PinRetMsg)
             return PinResponse(success=ret_msg.success)
         except Exception as e:
@@ -150,8 +166,7 @@ def create_app(controller_url: str) -> FastAPI:
                 locations=req.locations,
                 tokens=req.tokens,
             )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, CompressRetMsg)
             return CompressResponse(success=ret_msg.event_id)
         except Exception as e:
@@ -174,8 +189,7 @@ def create_app(controller_url: str) -> FastAPI:
                 new_position=req.new_position,
                 tokens=req.tokens,
             )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, MoveRetMsg)
             return MoveResponse(success=ret_msg.event_id)
         except Exception as e:
@@ -190,9 +204,10 @@ def create_app(controller_url: str) -> FastAPI:
     @app.post("/health", response_model=HealthResponse)
     async def health(req: HealthRequest):
         try:
-            msg = HealthMsg(instance_id=req.instance_id, )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            msg = HealthMsg(
+                instance_id=req.instance_id,
+            )
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, HealthRetMsg)
             return HealthResponse(alive=ret_msg.alive)
         except Exception as e:
@@ -207,9 +222,10 @@ def create_app(controller_url: str) -> FastAPI:
     @app.post("/check_finish", response_model=CheckFinishResponse)
     async def check_finish(req: CheckFinishRequest):
         try:
-            msg = CheckFinishMsg(event_id=req.event_id, )
-            ret_msg = await lmcache_controller_manager.\
-                handle_orchestration_message(msg)
+            msg = CheckFinishMsg(
+                event_id=req.event_id,
+            )
+            ret_msg = await lmcache_controller_manager.handle_orchestration_message(msg)
             assert isinstance(ret_msg, CheckFinishRetMsg)
             return CheckFinishResponse(finished=ret_msg.finished)
         except Exception as e:

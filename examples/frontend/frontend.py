@@ -1,6 +1,7 @@
+# Third Party
+from transformers import AutoTokenizer
 import chat_session
 import streamlit as st
-from transformers import AutoTokenizer
 
 # Change the following variables as needed
 
@@ -20,8 +21,8 @@ tokenizer = get_tokenizer()
 
 @st.cache_data
 def read_context() -> str:
-    context_file = 'ffmpeg.txt'
-    with open(context_file, 'r') as f:
+    context_file = "ffmpeg.txt"
+    with open(context_file, "r") as f:
         context_text = f.read()
     return context_text
 
@@ -41,8 +42,9 @@ with st.sidebar:
 
     session.set_context([system_prompt] + [context])
     num_tokens = tokenizer.encode(session.get_context())
-    container.header(f"The context given to LLM: ({len(num_tokens)} tokens)",
-                     divider="grey")
+    container.header(
+        f"The context given to LLM: ({len(num_tokens)} tokens)", divider="grey"
+    )
     container.text(session.get_context())
 
     messages = st.container(height=400)
