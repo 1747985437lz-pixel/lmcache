@@ -95,8 +95,4 @@ def CreateStorageBackends(
         backend_name = str(remote_backend)
         storage_backends[backend_name] = remote_backend
 
-    # TODO(Jiayi): Please support blending
-    config.enable_blending = False
-    assert config.enable_blending is False, "blending is not supported for now"
-
     return storage_backends
