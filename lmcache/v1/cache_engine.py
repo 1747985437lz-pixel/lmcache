@@ -45,10 +45,7 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MixedMemoryAllocator,
 )
-from lmcache.v1.storage_backend.storage_manager import (
-    DistributedStorageManager,
-    StorageManager,
-)
+from lmcache.v1.storage_backend.storage_manager import StorageManager
 from lmcache.v1.token_database import (
     ChunkedTokenDatabase,
     SegmentTokenDatabase,
@@ -111,20 +108,16 @@ class LMCacheEngine:
         if self.config.enable_controller:
             self.lmcache_worker = LMCacheWorker(config, metadata, self)
 
-        self.use_distributed_storage_manager = False
-        if config.enable_nixl:
-            self.use_distributed_storage_manager = True
-            self.storage_manager = DistributedStorageManager(
-                config, metadata, self.memory_allocator
-            )
-        else:
-            self.storage_manager = StorageManager(
-                config,
-                metadata,
-                self.memory_allocator,
-                self.lmcache_worker,
-                self.lookup_server,
-            )  # type: ignore[assignment]
+        self.storage_manager = StorageManager(
+            config,
+            metadata,
+            self.memory_allocator,
+            self.lmcache_worker,
+            self.lookup_server,
+        )
+
+        # HACK: remove this in the future
+        self.remove_after_retrieve = config.enable_nixl
 
         if self.enable_p2p:
             self.distributed_loop = asyncio.get_event_loop()
@@ -141,90 +134,6 @@ class LMCacheEngine:
 
         InitializeUsageContext(config.to_original_config(), metadata)
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
-
-    @_lmcache_nvtx_annotate
-    @torch.inference_mode()
-    def store_distributed(
-        self,
-        tokens: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> None:
-        """Store the tokens and mask into the cache engine.
-
-        This function is only for distributed storage manager.
-
-        This function will be refactored in the future.
-        """
-        st = time.perf_counter()
-        if mask is not None:
-            num_store_tokens = torch.sum(mask)
-        else:
-            num_store_tokens = len(tokens)
-        monitor_req_id = self.stats_monitor.on_store_request(num_store_tokens)
-
-        # Register the put request
-        keys = []
-        metadatas = []
-        steds = []
-        for start, end, key in self.token_database.process_tokens(tokens, mask):
-            assert isinstance(key, CacheEngineKey)
-            # Allocate the memory object
-            num_tokens = end - start
-            kv_shape = self.gpu_connector.get_shape(num_tokens)
-            kv_dtype = self.metadata.kv_dtype
-            memobj_meta = self.storage_manager.dry_allocate(kv_shape, kv_dtype)
-            assert memobj_meta is not None
-            keys.append(key)
-            metadatas.append(memobj_meta)
-            steds.append((start, end))
-
-        self.storage_manager.prepare_put(keys, metadatas)
-
-        offload_time = 0.0
-        put_time = 0.0
-        tot_kv_size = 0
-        # Offload the KV cache and write to remote
-        for key, memobj_meta, (start, end) in zip(keys, metadatas, steds, strict=False):
-            assert memobj_meta.dtype is not None
-            kv_shape = memobj_meta.shape
-            kv_dtype = memobj_meta.dtype
-
-            # Allocate for a zero-copy buffer, trigger send if needed
-            t = time.perf_counter()
-            memory_obj = self.storage_manager.allocate(kv_shape, kv_dtype)
-            put_time += time.perf_counter() - t
-            if memory_obj is None:
-                logger.warning(
-                    "Failed to allocate memory for the KV cache.\n"
-                    "The KV cache will not be stored."
-                )
-                break
-
-            # Copy the KV cache to the zero-copy buffer
-            t = time.perf_counter()
-            self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)
-            offload_time += time.perf_counter() - t
-
-            tot_kv_size += memory_obj.get_size()
-
-        # Flush
-        t = time.perf_counter()
-        self.storage_manager.commit_put()
-        put_time += time.perf_counter() - t
-        ed = time.perf_counter()
-
-        logger.info(
-            "Store %d tokens takes: %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            num_store_tokens,
-            (ed - st) * 1000,
-            tot_kv_size / (ed - st) / 1024**3,
-            offload_time * 1000,
-            put_time * 1000,
-        )
-
-        self.stats_monitor.on_store_finished(monitor_req_id)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -251,16 +160,22 @@ class LMCacheEngine:
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
-        # FIXME(ApostaC): A HACK for distributed storage manager
-        if self.use_distributed_storage_manager:
-            self.store_distributed(tokens, mask, **kwargs)
-            return
 
         if mask is not None:
             num_stored_tokens = torch.sum(mask).item()
         else:
             num_stored_tokens = len(tokens)
         monitor_req_id = self.stats_monitor.on_store_request(num_stored_tokens)
+
+        starts = []
+        ends = []
+        keys = []
+        memory_objs = []
+
+        offload_time = 0.0
+        put_time = 0.0
+        tot_kv_size = 0
+        t = time.perf_counter()
 
         for start, end, key in self.token_database.process_tokens(tokens, mask):
             assert isinstance(key, CacheEngineKey)
@@ -278,12 +193,34 @@ class LMCacheEngine:
                 )
                 break
 
-            self.gpu_connector.from_gpu(memory_obj, start, end, **kwargs)
-            self.storage_manager.put(key, memory_obj)
+            starts.append(start)
+            ends.append(end)
+            keys.append(key)
+            memory_objs.append(memory_obj)
 
-            # Update lookup server
-            if self.lookup_server is not None:
-                self.lookup_server.insert(key)
+            tot_kv_size = memory_obj.get_size()
+
+        self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+        offload_time += time.perf_counter() - t
+
+        t = time.perf_counter()
+        self.storage_manager.batched_put(keys, memory_objs)
+        put_time += time.perf_counter() - t
+
+        tot_time = offload_time + put_time
+
+        if self.lookup_server is not None:
+            self.lookup_server.batched_insert(key)
+
+        logger.debug(
+            "Store %d tokens takes: %.4f ms, throughput: %.4f GB/s; "
+            "offload_time: %.4f ms, put_time: %.4f ms",
+            num_stored_tokens,
+            tot_time * 1000,
+            tot_kv_size / tot_time / 1024**3,
+            offload_time * 1000,
+            put_time * 1000,
+        )
 
         self.stats_monitor.on_store_finished(monitor_req_id)
 
@@ -350,14 +287,13 @@ class LMCacheEngine:
             self.gpu_connector.to_gpu(memory_obj, start, end, **kwargs)
             memory_obj.ref_count_down()
 
-            if isinstance(self.storage_manager, StorageManager):
-                self.storage_manager.batched_unpin([key])
-
             # NOTE (ApostaC): This is only for the current implementation:
             # When the object is retrieved back to vLLM, the storage backend
             # will immediately remove the object from itself
-            if isinstance(self.storage_manager, DistributedStorageManager):
+            if self.remove_after_retrieve:
                 self.storage_manager.remove(key)
+            else:
+                self.storage_manager.batched_unpin([key])
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(monitor_req_id, retrieved_tokens)
