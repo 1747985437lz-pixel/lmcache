@@ -32,7 +32,11 @@ import vllm.envs as envs
 import zmq
 
 # First Party
-from lmcache.integration.vllm.utils import ENGINE_NAME, lmcache_get_config
+from lmcache.integration.vllm.utils import (
+    ENGINE_NAME,
+    apply_mm_hashes_to_token_ids,
+    lmcache_get_config,
+)
 from lmcache.integration.vllm.vllm_adapter import init_lmcache_engine
 from lmcache.logging import init_logger
 from lmcache.utils import _lmcache_nvtx_annotate
@@ -43,6 +47,7 @@ if TYPE_CHECKING:
     # Third Party
     from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
+    from vllm.multimodal.inputs import PlaceholderRange
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.sched.output import CachedRequestData, NewRequestData
     from vllm.v1.request import Request
@@ -168,6 +173,10 @@ class RequestTracker:
     # The number of tokens that has been savd
     num_saved_tokens: int = 0
 
+    # Multimodal hashes and positions
+    mm_hashes: Optional[list[str]] = None
+    mm_positions: Optional[list["PlaceholderRange"]] = None
+
     @staticmethod
     def from_new_request(
         new_request: "NewRequestData",
@@ -206,6 +215,8 @@ class RequestTracker:
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=0,
+            mm_hashes=new_request.mm_hashes.copy(),
+            mm_positions=new_request.mm_positions.copy(),
         )
 
     def update(
@@ -217,6 +228,7 @@ class RequestTracker:
         """
 
         self.token_ids.extend(cached_request.new_token_ids)
+
         new_block_ids: list[int]
 
         if len(cached_request.new_block_ids) == 0:
@@ -298,6 +310,12 @@ class ReqMeta:
         # OPTIMIZATION: pre-allocate the buffer for token ids and block
         # ids
         token_ids = torch.tensor(input_token_ids)[:num_tokens_to_save]
+
+        # If the request has multimodal hashes, apply them to the token ids
+        if tracker.mm_hashes:
+            apply_mm_hashes_to_token_ids(
+                token_ids, tracker.mm_hashes, tracker.mm_positions
+            )
 
         num_blocks = len(tracker.allocated_block_ids)
 
@@ -787,10 +805,18 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+
         if self.kv_role == "kv_producer":
             return 0
 
         token_ids = torch.tensor(request.prompt_token_ids)
+
+        # If the request has multimodal hashes, apply them to the token ids
+        if request.mm_hashes:
+            apply_mm_hashes_to_token_ids(
+                token_ids, request.mm_hashes, request.mm_positions
+            )
+
         if self.skip_last_n_tokens > 0:
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids[: -self.skip_last_n_tokens]
@@ -837,6 +863,7 @@ class LMCacheConnectorV1Impl:
         For SharedStorageConnector, update _request_needs_load
         if the CacheManager this allocated blocks for us.
         """
+
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
             return
