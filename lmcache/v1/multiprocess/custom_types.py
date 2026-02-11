@@ -141,12 +141,25 @@ class IPCCacheEngineKey:
 
     chunk_hash: bytes | None = None
 
-    def to_hash_keys(self, hasher: "TokenHasher") -> list["IPCCacheEngineKey"]:
+    def to_hash_keys(
+        self,
+        hasher: "TokenHasher",
+        full_chunk_only: bool = True,
+        prefix_hash: int | None = None,
+    ) -> list["IPCCacheEngineKey"]:
         """Compute chunk hashes and return one IPCCacheEngineKey per chunk.
 
         Preserves all fields in generated keys.
+
+        Args:
+            hasher: TokenHasher instance to compute chunk hashes
+            full_chunk_only: If True, only return keys for full chunks .
+                Else, return keys for all chunks (including partial ones).
+            prefix_hash: Optional int hash to combine with token_ids.
         """
-        chunk_hashes = hasher.compute_chunk_hashes(list(self.token_ids))
+        chunk_hashes = hasher.compute_chunk_hashes(
+            list(self.token_ids), full_chunk_only, prefix_hash
+        )
         return [
             IPCCacheEngineKey(
                 model_name=self.model_name,
