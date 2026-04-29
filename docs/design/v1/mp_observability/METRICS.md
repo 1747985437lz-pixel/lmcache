@@ -191,16 +191,26 @@ ratio is the fraction of tokens requested by a lookup that were served from
 either L1 or L2.  L0 (GPU prefix cache) is intentionally excluded — it is
 vLLM-owned and not observable from LMCache.
 
+Both counters carry `model_name` and `cache_salt` OTel attributes (captured
+at lookup time from `IPCCacheEngineKey`), enabling per-model and per-tenant
+slicing of the hit rate.  `cache_salt` can be high-cardinality; drop it at
+scrape time with `metric_relabel_configs` if storage cost matters.
+
 | OTel metric name | Prometheus name | Type | Source event | Calculation |
 |---|---|---|---|---|
-| `lmcache_mp.lookup_requested_tokens` | `lmcache_mp_lookup_requested_tokens_total` | Counter | `MP_LOOKUP_PREFETCH_END` | `+requested_tokens` |
-| `lmcache_mp.lookup_hit_tokens` | `lmcache_mp_lookup_hit_tokens_total` | Counter | `MP_LOOKUP_PREFETCH_END` | `+hit_tokens` |
+| `lmcache_mp.lookup_requested_tokens` | `lmcache_mp_lookup_requested_tokens_total` | Counter (attrs: `model_name`, `cache_salt`) | `MP_LOOKUP_PREFETCH_END` | `+requested_tokens` |
+| `lmcache_mp.lookup_hit_tokens` | `lmcache_mp_lookup_hit_tokens_total` | Counter (attrs: `model_name`, `cache_salt`) | `MP_LOOKUP_PREFETCH_END` | `+hit_tokens` |
 
 **What it answers:** What fraction of tokens requested by a lookup were served from cache (L1 or L2)?
 
 ```promql
+# Aggregate hit rate (all models, all salts):
 rate(lmcache_mp_lookup_hit_tokens_total[5m])
 / rate(lmcache_mp_lookup_requested_tokens_total[5m])
+
+# Per-model hit rate:
+sum(rate(lmcache_mp_lookup_hit_tokens_total[5m])) by (model_name)
+/ sum(rate(lmcache_mp_lookup_requested_tokens_total[5m])) by (model_name)
 ```
 
 > **Note:** Both counters are driven by the *same* event, so they always
@@ -299,6 +309,25 @@ registered adapter type (e.g. `"fs"`, `"nixl_store"`, `"mooncake_store"`)
 **What it answers:** What end-to-end throughput is each L2 adapter
 delivering? Which backends are keeping up with demand, and which are
 queue-bound or I/O-bound?
+
+---
+
+## Engine Counters
+
+Worker-scoped counters tied to what the MP server delivers back to each
+vLLM worker.  Labeled by `worker_id` — the vLLM worker instance id,
+distinct from any scheduler-scoped id used elsewhere.
+
+| OTel metric name | Prometheus name | Type | Source event | Calculation |
+|---|---|---|---|---|
+| `lmcache_mp.num_chunks_loaded` | `lmcache_mp_num_chunks_loaded_total` | Counter (attrs: `worker_id`, `model_name`, `cache_salt`) | `MP_RETRIEVE_END` | `+retrieved_count` per event |
+
+**What it answers:** How many LMCache chunks is each vLLM worker loading
+from LMCache into its engine?  Compare across workers to spot uneven
+demand or underserved ranks.  Slice by `model_name` to see per-model
+load volume in multi-model deployments, or by `cache_salt` for per-tenant
+attribution (note: `cache_salt` can be high-cardinality — drop it at
+scrape time with `metric_relabel_configs` if storage cost matters).
 
 ---
 

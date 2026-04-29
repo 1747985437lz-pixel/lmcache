@@ -289,11 +289,11 @@ intentionally excluded — it is vLLM-owned and not observable from LMCache.
      - Type
      - Description
    * - ``lmcache_mp.lookup_requested_tokens``
-     - Counter
+     - Counter (attrs: ``model_name``, ``cache_salt``)
      - Total tokens submitted for lookup (denominator of the L1+L2
        token-level hit rate). Only chunk-aligned tokens are counted.
    * - ``lmcache_mp.lookup_hit_tokens``
-     - Counter
+     - Counter (attrs: ``model_name``, ``cache_salt``)
      - Total tokens found in L1 or L2 during lookup (numerator of the
        L1+L2 token-level hit rate). Counts the contiguous prefix hit only.
 
@@ -301,12 +301,23 @@ Both counters are driven by the same event (``MP_LOOKUP_PREFETCH_END``),
 so they always advance together per completed lookup. Early-exit lookups
 contribute ``0`` to both, and abandoned lookups contribute to neither.
 
+The ``model_name`` and ``cache_salt`` attributes are captured at lookup
+time from ``IPCCacheEngineKey`` so dashboards can compute per-model or
+per-tenant hit rate. ``cache_salt`` can be high-cardinality (one entry
+per tenant or isolation domain); drop it at scrape time with
+``metric_relabel_configs`` if storage cost matters.
+
 **PromQL for hit rate:**
 
 .. code-block:: promql
 
+    # Aggregate (all models, all salts):
     rate(lmcache_mp_lookup_hit_tokens_total[5m])
     / rate(lmcache_mp_lookup_requested_tokens_total[5m])
+
+    # Per-model:
+    sum(rate(lmcache_mp_lookup_hit_tokens_total[5m])) by (model_name)
+    / sum(rate(lmcache_mp_lookup_requested_tokens_total[5m])) by (model_name)
 
 L0 (GPU) Block Lifecycle Histograms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -405,6 +416,29 @@ attribute — the registered adapter type (e.g. ``"fs"``, ``"nixl_store"``,
    * - ``lmcache_mp.l2_load_throughput_gbs``
      - Histogram
      - L2→L1 load throughput in GB/s per sampled (request, adapter) pair.
+
+Engine Counters
+~~~~~~~~~~~~~~~
+
+Worker-scoped counters tied to what the MP server delivers back to each
+vLLM worker via ``retrieve()``.  Labeled by ``worker_id`` (the vLLM
+worker instance id) — distinct from any scheduler-scoped id that may
+appear on other metrics.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 25 35
+
+   * - Metric
+     - Type
+     - Description
+   * - ``lmcache_mp.num_chunks_loaded``
+     - Counter (attrs: ``worker_id``, ``model_name``, ``cache_salt``)
+     - Total number of LMCache chunks loaded into the engine, summed
+       over all ``retrieve()`` completions.  Sliceable per worker, per
+       model, and per tenant / isolation domain (``cache_salt``).
+       ``cache_salt`` may be high-cardinality; drop it at scrape time
+       with ``metric_relabel_configs`` if storage cost matters.
 
 Observable Gauges
 ~~~~~~~~~~~~~~~~~
