@@ -102,6 +102,13 @@ Documentation
 :raw-html:`<br />`
 
 .. toctree::
+   :maxdepth: 2
+   :caption: Non-KV caching
+
+   non_kv_cache/encoder_cache
+:raw-html:`<br />`
+
+.. toctree::
    :maxdepth: 3
    :caption: Multiprocess Mode
 
