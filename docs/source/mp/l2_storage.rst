@@ -447,8 +447,8 @@ signature are still supported -- LMCache transparently falls back to
 the legacy form on :class:`TypeError`.  Refer to the
 `Mooncake documentation <https://github.com/kvcache-ai/Mooncake>`_
 for available setup keys (e.g., ``local_hostname``,
-``metadata_server``, ``master_server_address``, ``protocol``,
-``device_name``, ``global_segment_size``).
+``metadata_server``, ``master_server_addr``, ``protocol``,
+``rdma_devices``, ``global_segment_size``).
 
 **Configuration example:**
 
@@ -459,7 +459,7 @@ for available setup keys (e.g., ``local_hostname``,
       "num_workers": 4,
       "local_hostname": "node01",
       "metadata_server": "http://localhost:8080/metadata",
-      "master_server_address": "localhost:50051",
+      "master_server_addr": "localhost:50051",
       "protocol": "tcp",
       "local_buffer_size": "3221225472"
       "global_segment_size": "3221225472"
