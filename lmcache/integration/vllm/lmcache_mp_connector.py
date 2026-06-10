@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
+import math
 
 # Third Party
 from vllm.config import VllmConfig
@@ -76,6 +77,137 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+
+# Stable string helpers for vLLM KV cache specs. Kept local so this patch can
+# run against nightly vLLM builds where enum helpers may move.
+_ATTENTION_KV_CACHE_KINDS = {
+    "chunked_local_attention",
+    "full_attention",
+    "mla_attention",
+    "sink_full_attention",
+    "sliding_window",
+    "sliding_window_mla",
+}
+_NON_RECURRENT_KV_CACHE_KINDS = _ATTENTION_KV_CACHE_KINDS | {
+    "cross_attention",
+    "encoder_only_attention",
+}
+_KV_CACHE_SPEC_KIND_BY_NAME = {
+    "ChunkedLocalAttentionSpec": "chunked_local_attention",
+    "CrossAttentionSpec": "cross_attention",
+    "EncoderOnlyAttentionSpec": "encoder_only_attention",
+    "FullAttentionSpec": "full_attention",
+    "MLAAttentionSpec": "mla_attention",
+    "MambaSpec": "mamba",
+    "SinkFullAttentionSpec": "sink_full_attention",
+    "SlidingWindowMLASpec": "sliding_window_mla",
+    "SlidingWindowSpec": "sliding_window",
+    "TQFullAttentionSpec": "full_attention",
+}
+
+
+def _kv_cache_spec_kind(kv_cache_spec: Any) -> str:
+    try:
+        from vllm.v1.kv_cache_interface import get_kv_cache_spec_kind
+
+        return str(get_kv_cache_spec_kind(kv_cache_spec).value)
+    except Exception:
+        spec_name = kv_cache_spec.__class__.__name__
+        if spec_name == "UniformTypeKVCacheSpecs":
+            inner_kinds = {
+                _kv_cache_spec_kind(spec)
+                for spec in getattr(kv_cache_spec, "kv_cache_specs", {}).values()
+            }
+            return inner_kinds.pop() if len(inner_kinds) == 1 else "unknown"
+        return _KV_CACHE_SPEC_KIND_BY_NAME.get(spec_name, "unknown")
+
+
+def _is_hybrid_state_kv_cache_spec(kv_cache_spec: Any) -> bool:
+    kind = _kv_cache_spec_kind(kv_cache_spec)
+    if kind != "unknown":
+        return kind not in _NON_RECURRENT_KV_CACHE_KINDS
+    spec_name = kv_cache_spec.__class__.__name__
+    if spec_name == "UniformTypeKVCacheSpecs":
+        specs = getattr(kv_cache_spec, "kv_cache_specs", {})
+        return bool(specs) and all(
+            _is_hybrid_state_kv_cache_spec(spec) for spec in specs.values()
+        )
+    return spec_name.endswith("Spec")
+
+
+def _select_lmcache_kv_cache_group(
+    kv_cache_config: Any | None,
+) -> tuple[int, tuple[str, ...] | None, int | None]:
+    kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not kv_cache_groups:
+        return 0, None, None
+
+    candidate_group_id: int | None = None
+    for group_id, group in enumerate(kv_cache_groups):
+        kind = _kv_cache_spec_kind(group.kv_cache_spec)
+        if kind == "full_attention":
+            candidate_group_id = group_id
+            break
+        if candidate_group_id is None and kind in _ATTENTION_KV_CACHE_KINDS:
+            candidate_group_id = group_id
+
+    if candidate_group_id is None:
+        logger.warning(
+            "LMCache MP could not find a paged attention KV cache group; "
+            "falling back to group 0"
+        )
+        candidate_group_id = 0
+
+    group = kv_cache_groups[candidate_group_id]
+    block_size = getattr(group.kv_cache_spec, "block_size", None)
+    logger.info(
+        "LMCache MP selected vLLM KV cache group %d (%s) with %d layer(s), "
+        "block_size=%s",
+        candidate_group_id,
+        group.kv_cache_spec.__class__.__name__,
+        len(group.layer_names),
+        block_size,
+    )
+    return candidate_group_id, tuple(group.layer_names), block_size
+
+
+def _select_hybrid_state_kv_cache_groups(
+    kv_cache_config: Any | None,
+) -> list[dict[str, Any]]:
+    kv_cache_groups = getattr(kv_cache_config, "kv_cache_groups", None)
+    if not kv_cache_groups:
+        return []
+
+    hybrid_groups: list[dict[str, Any]] = []
+    for group_id, group in enumerate(kv_cache_groups):
+        spec = group.kv_cache_spec
+        if not _is_hybrid_state_kv_cache_spec(spec):
+            continue
+        block_size = getattr(spec, "block_size", None)
+        page_size_bytes = getattr(spec, "page_size_bytes", None)
+        if block_size is None or page_size_bytes is None:
+            continue
+        hybrid_groups.append(
+            {
+                "group_id": int(group_id),
+                "layer_names": list(group.layer_names),
+                "block_size": int(block_size),
+                "page_size_bytes": int(page_size_bytes),
+                "spec_name": spec.__class__.__name__,
+            }
+        )
+
+    if hybrid_groups:
+        logger.info(
+            "LMCache MP detected %d hybrid state KV cache group(s): %s",
+            len(hybrid_groups),
+            [
+                (g["group_id"], len(g["layer_names"]), g["block_size"])
+                for g in hybrid_groups
+            ],
+        )
+    return hybrid_groups
 
 
 # Helper functions
@@ -748,6 +880,90 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         logger.info("Registering kv caches!")
 
+        original_kv_caches = kv_caches
+        kv_cache_config = getattr(self, "_kv_cache_config", None)
+        (
+            lmcache_kv_cache_group_id,
+            selected_layer_names,
+            _selected_block_size,
+        ) = _select_lmcache_kv_cache_group(kv_cache_config)
+        hybrid_state_groups = _select_hybrid_state_kv_cache_groups(kv_cache_config)
+
+        if selected_layer_names is not None:
+            missing_layer_names = [
+                name for name in selected_layer_names if name not in original_kv_caches
+            ]
+            if missing_layer_names:
+                raise ValueError(
+                    "LMCache MP selected KV cache group "
+                    f"{lmcache_kv_cache_group_id}, but vLLM did not register "
+                    f"KV caches for layers {missing_layer_names}"
+                )
+            attention_kv_caches = {
+                name: original_kv_caches[name] for name in selected_layer_names
+            }
+        else:
+            attention_kv_caches = {
+                name: tensor
+                for name, tensor in original_kv_caches.items()
+                if isinstance(tensor, torch.Tensor)
+            }
+
+        bad_attention_layers = [
+            name
+            for name, tensor in attention_kv_caches.items()
+            if not isinstance(tensor, torch.Tensor)
+        ]
+        if bad_attention_layers:
+            raise TypeError(
+                "LMCache MP selected attention KV cache group "
+                f"{lmcache_kv_cache_group_id}, but these entries are not tensors: "
+                f"{bad_attention_layers[:8]}"
+            )
+        if not attention_kv_caches:
+            raise ValueError("LMCache MP found no attention KV tensors to register")
+
+        registration_kv_caches: dict[str, torch.Tensor] = dict(attention_kv_caches)
+        hybrid_state_entries: list[dict[str, Any]] = []
+        wrapper_index = len(registration_kv_caches)
+        for group in hybrid_state_groups:
+            for layer_name in group["layer_names"]:
+                state_tensors = original_kv_caches.get(layer_name)
+                if not isinstance(state_tensors, (list, tuple)) or not state_tensors:
+                    raise TypeError(
+                        "LMCache MP expected hybrid state layer "
+                        f"{layer_name} to be list/tuple[Tensor], got "
+                        f"{type(state_tensors).__name__}"
+                    )
+                for state_index, state_tensor in enumerate(state_tensors):
+                    if not isinstance(state_tensor, torch.Tensor):
+                        raise TypeError(
+                            "LMCache MP expected hybrid state tensor for "
+                            f"{layer_name}[{state_index}], got "
+                            f"{type(state_tensor).__name__}"
+                        )
+                    synthetic_name = (
+                        f"{layer_name}.__lmcache_mp_hybrid_state_{state_index}"
+                    )
+                    registration_kv_caches[synthetic_name] = state_tensor
+                    hybrid_state_entries.append(
+                        {
+                            "group_id": group["group_id"],
+                            "layer_name": layer_name,
+                            "state_index": state_index,
+                            "wrapper_index": wrapper_index,
+                        }
+                    )
+                    wrapper_index += 1
+
+        logger.info(
+            "LMCache MP registering %d attention tensor(s) plus %d hybrid "
+            "state tensor(s)",
+            len(attention_kv_caches),
+            len(hybrid_state_entries),
+        )
+        kv_caches = registration_kv_caches
+
         # Build per-positional-layer logical (scheduler) block size and
         # block-ID namespace from ``self._kv_cache_config.kv_cache_groups``.
         # Under hybrid KV cache management, each ``KVCacheGroupSpec``
@@ -800,7 +1016,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if kv_cache_config is not None and getattr(
             kv_cache_config, "kv_cache_groups", None
         ):
-            kv_cache_layer_names = list(kv_caches.keys())
+            kv_cache_layer_names = list(attention_kv_caches.keys())
             name_to_idx = {name: idx for idx, name in enumerate(kv_cache_layer_names)}
             num_positional = len(kv_cache_layer_names)
             per_layer_logical_block_size = [0] * num_positional
@@ -862,6 +1078,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 per_layer_kv_cache_group_id = None
                 per_layer_sliding_window = None
 
+        # The MP server receives a flat IPC wrapper list. The first N wrappers
+        # are paged attention KV tensors consumed by GPUCacheContext; the
+        # remaining wrappers are opaque Mamba/recurrent state pages described
+        # by the hybrid-state hints below.
+        lmcache_chunk_size = (
+            self.worker_adapter.num_blocks_per_chunk() * self.vllm_block_size
+        )
+        hybrid_alignment = (
+            math.lcm(
+                lmcache_chunk_size,
+                *(int(group["block_size"]) for group in hybrid_state_groups),
+            )
+            if hybrid_state_groups
+            else 0
+        )
+
         extra_layout_hints: dict[str, object] | None = None
         if (
             per_layer_logical_block_size is not None
@@ -881,6 +1113,16 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_layout_hints["per_layer_sliding_window"] = (
                     per_layer_sliding_window
                 )
+        if extra_layout_hints is None:
+            extra_layout_hints = {}
+        extra_layout_hints["lmcache_mp_attention_wrapper_count"] = len(
+            attention_kv_caches
+        )
+        extra_layout_hints["lmcache_mp_hybrid_state_groups"] = hybrid_state_groups
+        extra_layout_hints["lmcache_mp_hybrid_state_entries"] = hybrid_state_entries
+        extra_layout_hints["lmcache_mp_hybrid_state_alignment_tokens"] = (
+            hybrid_alignment
+        )
         self.worker_adapter.register_kv_caches(
             kv_caches, extra_layout_hints=extra_layout_hints
         )
