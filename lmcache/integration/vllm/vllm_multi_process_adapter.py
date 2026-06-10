@@ -17,8 +17,8 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CudaIPCWrapper,
     IPCCacheEngineKey,
-    KVCache,
     ViewPreservingCudaIPCWrapper,
+    KVCache,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class

@@ -9,6 +9,7 @@
 # Standard
 from typing import (
     TYPE_CHECKING,
+    Any,
     Literal,
     Optional,
     TypedDict,
@@ -154,6 +155,10 @@ class LayoutHints(TypedDict, total=False):
     per_layer_logical_block_size: list[int]
     per_layer_kv_cache_group_id: list[int]
     per_layer_sliding_window: list[int]
+    lmcache_mp_worker_id: int
+    lmcache_mp_attention_wrapper_count: int
+    lmcache_mp_hybrid_state_groups: list[dict[str, Any]]
+    lmcache_mp_hybrid_state_entries: list[dict[str, Any]]
 
 
 def attempt_permute_to_contiguous_view(

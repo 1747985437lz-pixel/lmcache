@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
+import hashlib
+import os
 import threading
 import time
 
@@ -36,11 +40,7 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import (
-    MemoryObj,
-    MemoryObjMetadata,
-    TensorMemoryObj,
-)
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
     add_observability_args,
@@ -148,53 +148,7 @@ def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayo
         else:
             shapes.append(gpu_context.get_kv_buffer_shape(num_tokens, group_idx))
     dtypes = [groups[group_idx].dtype for group_idx in range(num_groups)]
-
-    # Populate full_attn_bytes only on the chunked hot path for SWA-bearing
-    # models; otherwise leave it at the 0 sentinel.
-    full_attn_bytes = 0
-    if (
-        num_tokens == gpu_context.lmcache_logical_chunk_size
-        and gpu_context.has_swa_groups()
-    ):
-        full_attn_bytes = gpu_context.full_attn_bytes()
-    return MemoryLayoutDesc(
-        shapes=shapes, dtypes=dtypes, full_attn_bytes=full_attn_bytes
-    )
-
-
-def _make_short_memory_obj_view(
-    memory_obj: MemoryObj,
-    short_bytes: int,
-) -> MemoryObj:
-    """Return a non-owning view of ``memory_obj`` whose ``get_size()``
-    reports ``short_bytes``. Used to short-H2D the full-attention prefix
-    of non-tail chunks under SWA layouts (``lmcache_memcpy_async_h2d``
-    asserts ``meta.get_size() == gpu_buffer.nbytes``).
-
-    The view shares ``raw_data`` with ``memory_obj`` (no copy); its
-    ``parent_allocator`` is None so ``__del__`` is inert. Callers must
-    keep the view alive until the H2D copy is enqueued.
-    """
-    short_meta = MemoryObjMetadata(
-        shape=torch.Size([short_bytes]),
-        # uint8 + 1-D shape => get_size() == short_bytes.
-        dtype=torch.uint8,
-        address=memory_obj.meta.address,
-        phy_size=memory_obj.meta.phy_size,
-        ref_count=0,
-        pin_count=0,
-        fmt=memory_obj.meta.fmt,
-        # shapes/dtypes None so TensorMemoryObj treats this as a single
-        # contiguous segment of length short_bytes.
-        shapes=None,
-        dtypes=None,
-        full_attn_bytes=0,
-    )
-    return TensorMemoryObj(
-        raw_data=memory_obj.raw_data,
-        metadata=short_meta,
-        parent_allocator=None,
-    )
+    return MemoryLayoutDesc(shapes=shapes, dtypes=dtypes)
 
 
 def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None]:
@@ -234,6 +188,147 @@ class _PrefetchJob:
 
 
 # Main class for the mp cache engine
+
+
+@dataclass(frozen=True)
+class _HybridStateGroupSpec:
+    group_id: int
+    layer_names: tuple[str, ...]
+    block_size: int
+    page_size_bytes: int
+
+
+@dataclass(frozen=True)
+class _HybridStateEntrySpec:
+    group_id: int
+    layer_name: str
+    state_index: int
+    wrapper_index: int
+
+
+@dataclass
+class _HybridStateContext:
+    worker_id: int
+    groups: tuple[_HybridStateGroupSpec, ...]
+    entries: tuple[_HybridStateEntrySpec, ...]
+    state_tensors: dict[tuple[int, str, int], torch.Tensor]
+    page_tensors: dict[tuple[int, str, int], torch.Tensor]
+    alignment_tokens: int
+
+
+_HybridStateKey = tuple[str, int, str, int, int, str]
+_HybridStatePayload = dict[tuple[int, str, int], torch.Tensor]
+
+
+def _hybrid_state_l2_file_id(state_key: _HybridStateKey) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    for part in state_key:
+        encoded = str(part).encode("utf-8", "surrogatepass")
+        digest.update(len(encoded).to_bytes(4, "little", signed=False))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _clone_hybrid_payload_to_cpu(
+    payload: _HybridStatePayload,
+) -> _HybridStatePayload:
+    return {
+        entry_key: tensor.detach().to(device="cpu", copy=True)
+        for entry_key, tensor in payload.items()
+    }
+
+
+def _hash_hybrid_state_tokens(token_ids: tuple[int, ...], num_tokens: int) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(num_tokens.to_bytes(8, "little", signed=False))
+    for token_id in token_ids[:num_tokens]:
+        digest.update(int(token_id).to_bytes(8, "little", signed=True))
+    return digest.hexdigest()
+
+
+def _hybrid_state_key(
+    key: IPCCacheEngineKey,
+    worker_id: int,
+    num_tokens: int,
+) -> _HybridStateKey:
+    return (
+        key.model_name,
+        key.world_size,
+        key.cache_salt,
+        worker_id,
+        num_tokens,
+        _hash_hybrid_state_tokens(key.token_ids, num_tokens),
+    )
+
+
+def _make_hybrid_state_context(
+    kv_caches: KVCache,
+    layout_hints: LayoutHints,
+) -> _HybridStateContext | None:
+    groups_hint = layout_hints.get("lmcache_mp_hybrid_state_groups") or []
+    entries_hint = layout_hints.get("lmcache_mp_hybrid_state_entries") or []
+    if not groups_hint or not entries_hint:
+        return None
+
+    worker_id = int(layout_hints.get("lmcache_mp_worker_id", 0))
+    groups = tuple(
+        _HybridStateGroupSpec(
+            group_id=int(group["group_id"]),
+            layer_names=tuple(group["layer_names"]),
+            block_size=int(group["block_size"]),
+            page_size_bytes=int(group["page_size_bytes"]),
+        )
+        for group in groups_hint
+    )
+    entries = tuple(
+        _HybridStateEntrySpec(
+            group_id=int(entry["group_id"]),
+            layer_name=str(entry["layer_name"]),
+            state_index=int(entry["state_index"]),
+            wrapper_index=int(entry["wrapper_index"]),
+        )
+        for entry in entries_hint
+    )
+
+    state_tensors: dict[tuple[int, str, int], torch.Tensor] = {}
+    page_tensors: dict[tuple[int, str, int], torch.Tensor] = {}
+    for entry in entries:
+        if entry.wrapper_index >= len(kv_caches):
+            raise ValueError(
+                "Hybrid state wrapper index "
+                f"{entry.wrapper_index} is out of range for {len(kv_caches)} wrappers"
+            )
+        tensor = kv_caches[entry.wrapper_index].to_tensor()
+        state_tensors[(entry.group_id, entry.layer_name, entry.state_index)] = tensor
+        page_size_bytes = tensor[0].numel() * tensor.element_size()
+        storage_offset_bytes = tensor.storage_offset() * tensor.element_size()
+        page_tensors[(entry.group_id, entry.layer_name, entry.state_index)] = (
+            torch.tensor([], dtype=torch.int8, device=tensor.device).set_(
+                tensor.untyped_storage(),
+                storage_offset_bytes,
+                (tensor.shape[0], page_size_bytes),
+            )
+        )
+
+    alignment_tokens = int(
+        layout_hints.get("lmcache_mp_hybrid_state_alignment_tokens") or 0
+    )
+    return _HybridStateContext(
+        worker_id=worker_id,
+        groups=groups,
+        entries=entries,
+        state_tensors=state_tensors,
+        page_tensors=page_tensors,
+        alignment_tokens=alignment_tokens,
+    )
+
+
+def _largest_aligned_token_count(num_tokens: int, alignment: int) -> int:
+    if alignment <= 0:
+        return num_tokens
+    return num_tokens // alignment * alignment
+
+
 class MPCacheEngine:
     def __init__(
         self,
@@ -243,6 +338,37 @@ class MPCacheEngine:
     ):
         # GPU ID -> KV cache tensors
         self.gpu_contexts: dict[int, GPUCacheContext] = {}
+
+        # GPU ID -> MP hybrid/recurrent state context.
+        self.hybrid_state_contexts: dict[int, _HybridStateContext] = {}
+        # Process-local opaque state cache, keyed by model/world/salt/worker/prefix.
+        self.hybrid_state_cache: OrderedDict[
+            _HybridStateKey, _HybridStatePayload
+        ] = OrderedDict()
+        self.hybrid_state_cache_lock = threading.Lock()
+        self.hybrid_state_cache_max_entries = int(
+            os.environ.get(
+                "LMCACHE_MP_HYBRID_STATE_CACHE_MAX_ENTRIES",
+                os.environ.get("LMCACHE_HYBRID_STATE_CACHE_MAX", "128"),
+            )
+        )
+        logger.info(
+            "LMCache MP hybrid state L1 max entries=%d",
+            self.hybrid_state_cache_max_entries,
+        )
+        self.hybrid_state_l2_dir = self._select_hybrid_state_l2_dir(
+            storage_manager_config
+        )
+        self.hybrid_state_l2_max_files = int(
+            os.environ.get("LMCACHE_MP_HYBRID_STATE_L2_MAX_FILES", "256")
+        )
+        if self.hybrid_state_l2_dir is not None:
+            self.hybrid_state_l2_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "LMCache MP hybrid state L2 enabled at %s (max_files=%d)",
+                self.hybrid_state_l2_dir,
+                self.hybrid_state_l2_max_files,
+            )
 
         # GPU ID -> (model name, world size) as metadata
         # NOTE: This is mainly for determining the layout desc during prefetch
@@ -276,6 +402,89 @@ class MPCacheEngine:
 
         self._setup_metrics()
 
+    def _select_hybrid_state_l2_dir(
+        self,
+        storage_manager_config: StorageManagerConfig,
+    ) -> Path | None:
+        for adapter_config in storage_manager_config.l2_adapter_config.adapters:
+            base_path = getattr(adapter_config, "base_path", None)
+            if base_path:
+                return Path(str(base_path)) / "_lmcache_mp_hybrid_state"
+        return None
+
+    def _hybrid_state_l2_path(self, state_key: _HybridStateKey) -> Path | None:
+        if self.hybrid_state_l2_dir is None:
+            return None
+        return self.hybrid_state_l2_dir / (
+            _hybrid_state_l2_file_id(state_key) + ".pt"
+        )
+
+    def _write_hybrid_state_l2(
+        self,
+        state_key: _HybridStateKey,
+        payload: _HybridStatePayload,
+    ) -> None:
+        path = self._hybrid_state_l2_path(state_key)
+        if path is None or path.exists():
+            return
+        tmp_path = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "state_key": state_key,
+                    "payload": _clone_hybrid_payload_to_cpu(payload),
+                },
+                tmp_path,
+            )
+            os.replace(tmp_path, path)
+            logger.info("Stored hybrid state L2 file %s", path)
+            self._evict_hybrid_state_l2_if_needed()
+        except Exception:
+            logger.exception("Failed to store hybrid state L2 file %s", path)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _load_hybrid_state_l2(
+        self,
+        state_key: _HybridStateKey,
+    ) -> _HybridStatePayload | None:
+        path = self._hybrid_state_l2_path(state_key)
+        if path is None or not path.exists():
+            return None
+        try:
+            data = torch.load(path, map_location="cpu", weights_only=False)
+            if data.get("state_key") != state_key:
+                logger.warning("Hybrid state L2 key mismatch for %s", path)
+                return None
+            payload = data.get("payload")
+            if not isinstance(payload, dict):
+                logger.warning("Hybrid state L2 payload is invalid for %s", path)
+                return None
+            logger.info("Loaded hybrid state L2 file %s", path)
+            return payload
+        except Exception:
+            logger.exception("Failed to load hybrid state L2 file %s", path)
+            return None
+
+    def _evict_hybrid_state_l2_if_needed(self) -> None:
+        if self.hybrid_state_l2_dir is None or self.hybrid_state_l2_max_files <= 0:
+            return
+        files = list(self.hybrid_state_l2_dir.glob("*.pt"))
+        overflow = len(files) - self.hybrid_state_l2_max_files
+        if overflow <= 0:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime)
+        for path in files[:overflow]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.exception("Failed to evict hybrid state L2 file %s", path)
+
     def register_kv_cache(
         self,
         instance_id: int,
@@ -307,13 +516,29 @@ class MPCacheEngine:
             )
             return
 
+        layout_hints = layout_hints or {}
+        attention_wrapper_count = int(
+            layout_hints.get("lmcache_mp_attention_wrapper_count", len(kv_caches))
+        )
+        attention_kv_caches = kv_caches[:attention_wrapper_count]
+        hybrid_state_context = _make_hybrid_state_context(kv_caches, layout_hints)
         gpu_context = GPUCacheContext(
-            kv_caches,
+            attention_kv_caches,
             self.chunk_size,
             layout_hints=layout_hints or None,
             engine_type=engine_type,
         )
         self.gpu_contexts[instance_id] = gpu_context
+        if hybrid_state_context is not None:
+            self.hybrid_state_contexts[instance_id] = hybrid_state_context
+            logger.info(
+                "Registered hybrid state context for GPU ID %d, worker %d, "
+                "%d group(s), %d tensor page(s)",
+                instance_id,
+                hybrid_state_context.worker_id,
+                len(hybrid_state_context.groups),
+                len(hybrid_state_context.page_tensors),
+            )
         self.gpu_context_meta[instance_id] = (model_name, world_size)
         logger.info(
             "Registered KV cache for GPU ID %d with %d layers",
@@ -330,6 +555,7 @@ class MPCacheEngine:
         """
         if instance_id in self.gpu_contexts:
             del self.gpu_contexts[instance_id]
+            self.hybrid_state_contexts.pop(instance_id, None)
             del self.gpu_context_meta[instance_id]
             logger.info("Unregistered KV cache for GPU ID %d", instance_id)
             torch_dev.empty_cache()
@@ -536,6 +762,8 @@ class MPCacheEngine:
                     lmcache_memcpy_async_d2h(
                         gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
                     )
+                if reserved_dict:
+                    self._store_hybrid_state(key, instance_id, gpu_block_ids)
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
@@ -575,6 +803,211 @@ class MPCacheEngine:
                 ed - st,
             )
         return event.ipc_handle(), True
+
+    def _registered_worker_ids(self, model_name: str, world_size: int) -> list[int]:
+        worker_ids: list[int] = []
+        for instance_id, (registered_model, registered_world_size) in (
+            self.gpu_context_meta.items()
+        ):
+            if registered_model != model_name or registered_world_size != world_size:
+                continue
+            ctx = self.hybrid_state_contexts.get(instance_id)
+            if ctx is not None:
+                worker_ids.append(ctx.worker_id)
+        return sorted(set(worker_ids))
+
+    def _has_hybrid_state_model(self, model_name: str, world_size: int) -> bool:
+        return bool(self._registered_worker_ids(model_name, world_size))
+
+    def _put_hybrid_state_payload(
+        self,
+        state_key: _HybridStateKey,
+        payload: _HybridStatePayload,
+        *,
+        persist_l2: bool = True,
+    ) -> None:
+        with self.hybrid_state_cache_lock:
+            self.hybrid_state_cache[state_key] = payload
+            self.hybrid_state_cache.move_to_end(state_key)
+            # Keep the in-process state bounded; persistent L2 keeps the recent
+            # restart-survivable state files separately.
+            while (
+                len(self.hybrid_state_cache)
+                > self.hybrid_state_cache_max_entries
+            ):
+                self.hybrid_state_cache.popitem(last=False)
+        if persist_l2:
+            self._write_hybrid_state_l2(state_key, payload)
+
+    def _get_hybrid_state_payload(
+        self,
+        state_key: _HybridStateKey,
+    ) -> _HybridStatePayload | None:
+        with self.hybrid_state_cache_lock:
+            payload = self.hybrid_state_cache.get(state_key)
+            if payload is not None:
+                self.hybrid_state_cache.move_to_end(state_key)
+                return payload
+        payload = self._load_hybrid_state_l2(state_key)
+        if payload is not None:
+            self._put_hybrid_state_payload(state_key, payload, persist_l2=False)
+        return payload
+
+    def _store_hybrid_state(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+    ) -> None:
+        ctx = self.hybrid_state_contexts.get(instance_id)
+        if ctx is None or key.worker_id is None:
+            return
+        num_tokens = _largest_aligned_token_count(key.end, ctx.alignment_tokens)
+        if num_tokens <= key.start:
+            return
+        state_key = _hybrid_state_key(key, ctx.worker_id, num_tokens)
+        if self._get_hybrid_state_payload(state_key) is not None:
+            return
+
+        payload: _HybridStatePayload = {}
+        for group in ctx.groups:
+            if num_tokens % group.block_size != 0:
+                return
+            relative_block_index = (num_tokens - key.start) // group.block_size - 1
+            if relative_block_index < 0:
+                return
+            try:
+                block_id = gpu_block_ids[group.group_id][relative_block_index]
+            except IndexError:
+                logger.warning(
+                    "Cannot store hybrid state for request %s: group %d block index "
+                    "%d missing",
+                    key.request_id,
+                    group.group_id,
+                    relative_block_index,
+                )
+                return
+            if block_id <= 0:
+                return
+            for layer_name in group.layer_names:
+                for entry in ctx.entries:
+                    if entry.group_id != group.group_id or entry.layer_name != layer_name:
+                        continue
+                    page_tensor = ctx.page_tensors.get(
+                        (entry.group_id, entry.layer_name, entry.state_index)
+                    )
+                    if page_tensor is None or block_id >= page_tensor.shape[0]:
+                        return
+                    payload[(entry.group_id, entry.layer_name, entry.state_index)] = (
+                        page_tensor[block_id].detach().to(device="cpu", copy=True)
+                    )
+
+        if payload:
+            self._put_hybrid_state_payload(state_key, payload)
+            logger.info(
+                "Stored hybrid state for request %s worker %d at %d token(s) "
+                "across %d tensor page(s)",
+                key.request_id,
+                ctx.worker_id,
+                num_tokens,
+                len(payload),
+            )
+
+    def _load_hybrid_state(
+        self,
+        key: IPCCacheEngineKey,
+        instance_id: int,
+        gpu_block_ids: list[list[int]],
+    ) -> bool:
+        ctx = self.hybrid_state_contexts.get(instance_id)
+        if ctx is None or key.worker_id is None:
+            return True
+        num_tokens = _largest_aligned_token_count(key.end, ctx.alignment_tokens)
+        state_key = _hybrid_state_key(key, ctx.worker_id, num_tokens)
+        payload = self._get_hybrid_state_payload(state_key)
+        if payload is None:
+            logger.error(
+                "Request %s has no cached hybrid state for worker %d at %d token(s)",
+                key.request_id,
+                ctx.worker_id,
+                num_tokens,
+            )
+            return False
+
+        for group in ctx.groups:
+            if num_tokens % group.block_size != 0:
+                return False
+            relative_block_index = (num_tokens - key.start) // group.block_size - 1
+            if relative_block_index < 0:
+                return False
+            try:
+                block_id = gpu_block_ids[group.group_id][relative_block_index]
+            except IndexError:
+                return False
+            if block_id <= 0:
+                return False
+            for layer_name in group.layer_names:
+                for entry in ctx.entries:
+                    if entry.group_id != group.group_id or entry.layer_name != layer_name:
+                        continue
+                    page_tensor = ctx.page_tensors.get(
+                        (entry.group_id, entry.layer_name, entry.state_index)
+                    )
+                    source_page = payload.get(
+                        (entry.group_id, entry.layer_name, entry.state_index)
+                    )
+                    if (
+                        page_tensor is None
+                        or source_page is None
+                        or block_id >= page_tensor.shape[0]
+                    ):
+                        return False
+                    page_tensor[block_id].copy_(source_page.to(device=page_tensor.device))
+
+        logger.info(
+            "Loaded hybrid state for request %s worker %d at %d token(s)",
+            key.request_id,
+            ctx.worker_id,
+            num_tokens,
+        )
+        return True
+
+    def _get_hybrid_state_loadable_count(
+        self,
+        key: IPCCacheEngineKey,
+        found_count: int,
+    ) -> int:
+        if found_count <= 0 or not self._has_hybrid_state_model(
+            key.model_name, key.world_size
+        ):
+            return found_count
+        worker_ids = self._registered_worker_ids(key.model_name, key.world_size)
+        if not worker_ids:
+            return 0
+        chunks = found_count
+        while chunks > 0:
+            num_tokens = chunks * self.chunk_size
+            if all(
+                self._get_hybrid_state_payload(_hybrid_state_key(key, wid, num_tokens))
+                is not None
+                for wid in worker_ids
+            ):
+                if chunks < found_count:
+                    logger.info(
+                        "Hybrid state gated LMCache hit for request %s from %d to "
+                        "%d chunk(s)",
+                        key.request_id,
+                        found_count,
+                        chunks,
+                    )
+                return chunks
+            chunks -= 1
+        logger.info(
+            "Hybrid state gated LMCache hit for request %s from %d chunk(s) to 0",
+            key.request_id,
+            found_count,
+        )
+        return 0
 
     @_lmcache_nvtx_annotate
     def retrieve(
@@ -663,14 +1096,6 @@ class MPCacheEngine:
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = gpu_context.max_batch_size
             groups = gpu_context.kv_layer_groups_manager.kv_layer_groups
-            # Only the tail chunk of the entire retrieve carries SWA bytes
-            # that may be consumed by future queries; non-tail chunks can
-            # skip the SWA suffix in both H2D and scatter.
-            has_swa = gpu_context.has_swa_groups()
-            last_chunk_global_idx = len(memory_objs) - 1
-            # Keep short MemoryObj views alive across the H2D enqueue
-            # window; cleared after the loop.
-            short_view_keepalive: list[MemoryObj] = []
             for batch_idx, memory_obj_batch in enumerate(
                 batched_iteration(memory_objs, batch_size=_BATCH_SIZE)
             ):
@@ -705,33 +1130,12 @@ class MPCacheEngine:
                 end_chunk_id = start_chunk_id + batch_len
 
                 # Copy from CPU to GPU tmp buffers, then scatter to paged KV — per group
-                # H2D copy: each memory_obj maps to its own batch slot.
-                # SWA short-read: for non-tail chunks under a SWA layout,
-                # only copy the full_attn_bytes prefix; the SWA suffix is
-                # left as residual since scatter skips SWA on non-tail.
+                # H2D copy: each memory_obj maps to its own batch slot
                 for chunk_idx, memory_obj in enumerate(memory_obj_batch):
-                    global_chunk_idx = start_chunk_id + chunk_idx
-                    is_tail = global_chunk_idx == last_chunk_global_idx
-                    obj_full_attn_bytes = memory_obj.meta.full_attn_bytes
-                    obj_total_bytes = memory_obj.get_size()
-                    if (
-                        has_swa
-                        and not is_tail
-                        and 0 < obj_full_attn_bytes < obj_total_bytes
-                    ):
-                        # Short H2D into the essential prefix only.
-                        short_view = _make_short_memory_obj_view(
-                            memory_obj, obj_full_attn_bytes
-                        )
-                        short_view_keepalive.append(short_view)
-                        gpu_dst = gpu_context.get_essential_chunk_view(chunk_idx)
-                        lmcache_memcpy_async_h2d(short_view, gpu_dst)
-                    else:
-                        # Full H2D: tail chunk, non-SWA, or legacy cache.
-                        lmcache_memcpy_async_h2d(
-                            memory_obj,
-                            gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
-                        )
+                    lmcache_memcpy_async_h2d(
+                        memory_obj,
+                        gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
+                    )
                 for group_idx, group in enumerate(groups):
                     bpc_g = gpu_context.blocks_per_chunk(group_idx)
                     bpc_full_g = gpu_context.blocks_per_chunk_full(group_idx)
@@ -739,66 +1143,11 @@ class MPCacheEngine:
                     ns_block_ids_gpu = staged_block_ids_per_namespace[
                         group.kv_cache_group_id
                     ]
-
-                    # SWA tail-only scatter: under SWA, only the tail
-                    # chunk's SWA bytes may be consumed; non-tail chunks
-                    # had a short H2D so their SWA region is residual
-                    # and must NOT be scattered to paged KV.
-                    if has_swa and group.sliding_window > 0:
-                        tail_local_idx = last_chunk_global_idx - start_chunk_id
-                        if not (0 <= tail_local_idx < batch_len):
-                            # Tail chunk not in this batch.
-                            continue
-                        # Trailing bpc_g blocks of the tail chunk's slot.
-                        tail_chunk_global = start_chunk_id + tail_local_idx
-                        chunk_offset = tail_chunk_global * bpc_full_g + (
-                            bpc_full_g - bpc_g
-                        )
-                        within_chunk = torch.arange(
-                            bpc_g,
-                            device=ns_block_ids_gpu.device,
-                            dtype=torch.long,
-                        )
-                        gather_idx = within_chunk + chunk_offset
-                        chunk_block_ids_gpu = ns_block_ids_gpu[gather_idx]
-                        if skip_tokens_in_chunk % group.logical_block_size != 0:
-                            logger.error(
-                                "skip_first_n_tokens (%d) is not aligned to "
-                                "group %d logical_block_size (%d); rounding down",
-                                skip_first_n_tokens,
-                                group_idx,
-                                group.logical_block_size,
-                            )
-                        skip_blocks_in_chunk_g = (
-                            skip_tokens_in_chunk // group.logical_block_size
-                        )
-                        # Single tmp slot view for the tail chunk only.
-                        all_tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
-                            batch_len, group_idx
-                        )
-                        tmp_buffers = [all_tmp_buffers[tail_local_idx]]
-                        group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                        lmc_ops.multi_layer_block_kv_transfer(
-                            group_kv_pointers,
-                            [tb.data_ptr() for tb in tmp_buffers],
-                            chunk_block_ids_gpu,
-                            gpu_context.device,
-                            lmc_ops.TransferDirection.H2D,
-                            gpu_context.get_shape_desc(group_idx),
-                            kernel_chunk_tokens,
-                            gpu_context.gpu_kv_format_,
-                            skip_blocks_in_chunk_g,
-                        )
-                        continue
-
-                    # Full-attention groups: original scatter logic.
                     if group.sliding_window > 0 and bpc_g != bpc_full_g:
                         # SWA-suffix: pick the trailing ``bpc_g`` block IDs
                         # from each ``bpc_full_g``-sized chunk slot in
                         # ``ns_block_ids_gpu``. Build a flat gather index
                         # ``[batch_len * bpc_g]`` once per kernel call.
-                        # Defensive fallback: unreachable when has_swa is
-                        # True (handled by the tail-only branch above).
                         chunk_offsets = torch.arange(
                             batch_len,
                             device=ns_block_ids_gpu.device,
@@ -871,9 +1220,6 @@ class MPCacheEngine:
                         gpu_context.gpu_kv_format_,
                         skip_blocks_in_chunk_g,
                     )
-            # All H2D copies and scatter kernels have been enqueued; safe
-            # to drop the short-view keep-alive references.
-            short_view_keepalive.clear()
 
         with (
             torch_dev.device(gpu_context.device),
@@ -904,6 +1250,8 @@ class MPCacheEngine:
 
                     prefetched_keys = obj_keys[: len(memory_objs)]
                     total_bytes = sum(mo.get_size() for mo in memory_objs)
+                    if not self._load_hybrid_state(key, instance_id, gpu_block_ids):
+                        return event.ipc_handle(), False
                     _retrieve_loop(obj_keys, memory_objs)
                 # Only set True when with-block exits normally
                 retrieve_succeeded = True
@@ -1159,6 +1507,10 @@ class MPCacheEngine:
         # 2. the lookup sort the keys in prefix order and breaks at the
         #    first failure
         found_count = found_count // job.world_size
+        found_count = self._get_hybrid_state_loadable_count(
+            job.handle.key if hasattr(job.handle, "key") else self.session_manager.get_or_create(job.request_id).lookup_ipc_key,
+            found_count,
+        )
 
         self._event_bus.publish(
             Event(
@@ -1305,6 +1657,13 @@ class MPCacheEngine:
             "engine_type": self.__class__.__name__,
             "chunk_size": self.chunk_size,
             "hash_algorithm": self.token_hasher.hash_algorithm_name,
+            "hybrid_state_l2_dir": str(self.hybrid_state_l2_dir)
+            if self.hybrid_state_l2_dir is not None
+            else None,
+            "hybrid_state_l2_files": len(list(self.hybrid_state_l2_dir.glob("*.pt")))
+            if self.hybrid_state_l2_dir is not None
+            else 0,
+            "hybrid_state_memory_entries": len(self.hybrid_state_cache),
             "registered_gpu_ids": list(self.gpu_contexts.keys()),
             "gpu_context_meta": gpu_context_meta,
             "active_sessions": self.session_manager.active_count(),
@@ -1347,6 +1706,8 @@ class MPCacheEngine:
         with self.lock:
             self.storage_manager.memcheck()
             self.storage_manager.clear(force=True)
+            with self.hybrid_state_cache_lock:
+                self.hybrid_state_cache.clear()
             self.storage_manager.memcheck()
 
     def close(self) -> None:
