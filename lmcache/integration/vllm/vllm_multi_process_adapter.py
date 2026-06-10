@@ -17,6 +17,7 @@ from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
     CudaIPCWrapper,
     IPCCacheEngineKey,
+    ViewPreservingCudaIPCWrapper,
     KVCache,
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
@@ -49,7 +50,15 @@ def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
         ),
     )
     logger.info("Wrapping %d KV cache tensors for IPC", len(kv_caches))
-    return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
+    wrappers = []
+    for name, tensor in kv_caches.items():
+        wrapper_cls = (
+            ViewPreservingCudaIPCWrapper
+            if ".__lmcache_mp_hybrid_state_" in name
+            else CudaIPCWrapper
+        )
+        wrappers.append(wrapper_cls(tensor))
+    return wrappers
 
 
 def send_lmcache_request(
@@ -911,6 +920,7 @@ class LMCacheMPWorkerAdapter:
         layout_hints["inference_engine_logical_block_size"] = (
             self.vllm_logical_block_size
         )
+        layout_hints["lmcache_mp_worker_id"] = self.worker_id
         if self.extra_layout_hints:
             layout_hints.update(self.extra_layout_hints)
         future = send_lmcache_request(
