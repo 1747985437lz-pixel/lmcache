@@ -127,6 +127,30 @@ class CudaIPCWrapper:
         return pickle.loads(data)
 
 
+class ViewPreservingCudaIPCWrapper(CudaIPCWrapper):
+    """CUDA IPC wrapper that preserves arbitrary tensor views.
+
+    Attention KV tensors still use CudaIPCWrapper's layout validation because
+    LMCache kernels infer physical page layout from shape metadata. Qwen3.6
+    Mamba/linear_attn state is opaque to those kernels; the MP server only
+    copies raw state pages, so preserving shape/stride/storage_offset is the
+    correct behavior for these tensors.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        storage = tensor.untyped_storage()
+        handle = storage._share_cuda_()
+
+        self.handle = handle
+        self.dtype = tensor.dtype
+        self.shape = tuple(tensor.shape)
+        self.stride = tuple(tensor.stride())
+        self.storage_offset = int(tensor.storage_offset())
+
+        device_index = tensor.device.index
+        self.device_uuid = CudaIPCWrapper._get_device_uuid(device_index)
+
+
 class RawCudaIPCWrapper(CudaIPCWrapper):
     """IPC wrapper for CUDA tensors allocated outside PyTorch's caching
     allocator.
