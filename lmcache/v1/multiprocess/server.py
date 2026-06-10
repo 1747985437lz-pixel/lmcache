@@ -887,7 +887,7 @@ class MPCacheEngine:
                     relative_block_index,
                 )
                 return
-            if block_id <= 0:
+            if block_id < 0:
                 return
             for layer_name in group.layer_names:
                 for entry in ctx.entries:
@@ -944,7 +944,7 @@ class MPCacheEngine:
                 block_id = gpu_block_ids[group.group_id][relative_block_index]
             except IndexError:
                 return False
-            if block_id <= 0:
+            if block_id < 0:
                 return False
             for layer_name in group.layer_names:
                 for entry in ctx.entries:
